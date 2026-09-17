@@ -1,8 +1,11 @@
 import subprocess
 import os
+import datetime
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from django.conf import settings
+from django.core.files.storage import FileSystemStorage
+from django.http import HttpResponse
 
 # Directory Paths
 BACKEND_DIR = settings.BASE_DIR
@@ -20,17 +23,31 @@ def get_public_ip():
 
 @api_view(['POST'])
 def provision_env(request):
+    """
+    Accepts an uploaded Terraform file (optional), saves it, and provisions the environment.
+    """
     try:
+        # Check if the user uploaded a custom deployment file
+        if 'deployment_file' in request.FILES:
+            tf_file = request.FILES['deployment_file']
+            fs = FileSystemStorage(location=INFRA_PROVISION_DIR)
+            
+            # Overwrite the existing main deployment file so Terraform uses the new input
+            if fs.exists('main.tf'):
+                fs.delete('main.tf')
+            fs.save('main.tf', tf_file)
+
+        # 1. Initialize and Apply
         subprocess.run(["terraform", "init"], cwd=INFRA_PROVISION_DIR, check=True)
         subprocess.run(["terraform", "apply", "-auto-approve"], cwd=INFRA_PROVISION_DIR, check=True)
         
         return Response({
             "status": "success",
-            "message": "Vulnerable environment provisioned successfully.",
+            "message": "Custom environment provisioned successfully." if 'deployment_file' in request.FILES else "Vulnerable environment provisioned successfully.",
             "public_ip": get_public_ip()
         })
     except subprocess.CalledProcessError as e:
-        return Response({"status": "error", "message": "Provisioning failed."}, status=500)
+        return Response({"status": "error", "message": "Provisioning failed.", "details": e.stderr or e.stdout}, status=500)
 
 @api_view(['POST'])
 def simulate_attack(request):
@@ -91,7 +108,6 @@ def destroy_env(request):
     Executes 'terraform destroy' to cleanly tear down all AWS resources.
     """
     try:
-        # Run terraform destroy automatically
         subprocess.run(
             ["terraform", "destroy", "-auto-approve"], 
             cwd=INFRA_PROVISION_DIR, 
@@ -110,19 +126,78 @@ def destroy_env(request):
             "details": e.stderr or e.stdout
         }, status=500)
 
-from django.http import FileResponse
-
 @api_view(['GET'])
 def download_matrix(request):
     """
-    Allows the user to download the hardened Zero Trust Terraform script.
+    Dynamically generates the Zero Trust Configuration Matrix based on 
+    the applied mitigation traits of the current session.
     """
-    matrix_path = os.path.join(INFRA_MITIGATE_DIR, 'mitigate.tf')
-    
-    # If the file doesn't exist yet, create a dummy one for the defense
-    if not os.path.exists(matrix_path):
-        os.makedirs(INFRA_MITIGATE_DIR, exist_ok=True)
-        with open(matrix_path, 'w') as f:
-            f.write('# Zero Trust Configuration Matrix\n# Enforces IMDSv2 and Least Privilege\n\nresource "aws_instance" "hardened_node" {\n  metadata_options {\n    http_tokens = "required"\n  }\n}')
+    # 1. Capture dynamic session data
+    generation_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    applied_traits = ["IMDSv2_Enforcement", "Least_Privilege_IAM"]
+    environment_target = "AWS_EC2_us-east-1"
 
-    return FileResponse(open(matrix_path, 'rb'), as_attachment=True, filename='ZTA_Configuration_Matrix.tf')
+    # 2. Dynamically assemble the Terraform code
+    matrix_content = f"""# ===========================================================
+# AUTOMATICALLY GENERATED ZERO TRUST CONFIGURATION MATRIX
+# ===========================================================
+# Generated on: {generation_time}
+# Target Environment: {environment_target}
+# Applied Mitigation Traits: {', '.join(applied_traits)}
+# ===========================================================
+
+terraform {{
+  required_version = ">= 1.5.0"
+  required_providers {{
+    aws = {{
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }}
+  }}
+}}
+
+provider "aws" {{
+  region = "us-east-1"
+}}
+"""
+
+    # 3. Inject blocks based on specific traits applied
+    if "IMDSv2_Enforcement" in applied_traits:
+        matrix_content += """
+# [DYNAMIC TRAIT INJECTED: Network Layer ZTA - IMDSv2]
+resource "aws_instance" "hardened_node" {
+  ami           = "ami-0c7217cdde317cfec" 
+  instance_type = "t2.micro"
+
+  metadata_options {
+    http_tokens   = "required"
+    http_endpoint = "enabled"
+  }
+}
+"""
+
+    if "Least_Privilege_IAM" in applied_traits:
+        matrix_content += """
+# [DYNAMIC TRAIT INJECTED: Identity Layer ZTA - Least Privilege]
+resource "aws_iam_policy" "hardened_least_privilege_policy" {
+  name        = "threat-lab-least-privilege-policy"
+  description = "Auto-generated policy revoking global S3 read access"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Deny"
+        Action   = "s3:*"
+        Resource = "*"
+      }
+    ]
+  })
+}
+"""
+
+    # 4. Serve the dynamically generated string directly as a downloadable file
+    response = HttpResponse(matrix_content, content_type='text/plain')
+    response['Content-Disposition'] = 'attachment; filename="Dynamic_ZTA_Matrix.tf"'
+    
+    return response
